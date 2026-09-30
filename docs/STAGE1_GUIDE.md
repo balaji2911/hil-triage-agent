@@ -38,7 +38,7 @@ For each file, write down the answer to each question in a sentence or two. The 
 
 **`faults.py`**
 1. Why is the label fixed at generation time and never re-derived from the trace?
-2. Why is the onset placed in the middle 60% of the run?
+2. Why is the onset placed in the middle 60% of the run? Then look at the comment above `rng =` in `inject_fault`: it describes a bug found in review. Faulty cases could only get onsets after ~3.2 s, because two functions drew from the same random stream. Explain it in your own words; it's a good interview story.
 3. Why are 20% of cases clean?
 4. Why does `inject_fault` never mutate its input?
 
@@ -50,8 +50,8 @@ For each file, write down the answer to each question in a sentence or two. The 
 5. Why does the most specific finding win when several signals flag?
 
 **`llm.py`**
-1. Why a forced tool call with enums, instead of asking for JSON?
-2. Why temperature 0?
+1. Why structured outputs with enums, instead of asking nicely for JSON? Why validate anyway?
+2. The model doesn't accept a temperature setting. How do you know a score difference isn't just run-to-run noise?
 3. Why a wide table, and what does a dropout look like in it?
 4. Why give the LLM the fault definitions but no thresholds?
 
@@ -68,16 +68,17 @@ Answer these in the file they belong to: seeding goes with `trace.py`, the middl
 ## Step 5: run the LLM and read the number
 
 ```powershell
-python -m triage.harness --llm --n 5     # check the key works, a few cents
-python -m triage.harness --llm           # full run, roughly $1
+python -m triage.harness --llm --n 5     # check the key works; read the cost per case
+python -m triage.harness --llm           # full run, roughly $1-4
 ```
 
 Then open `results/llm_predictions.jsonl` and read the explanations on the cases the LLM got wrong. Where the LLM loses to the rules, and where it adds something the rules can't (the explanation text), is the material for the stage 2 README and for the interview.
 
 ## Where the rules lose points (seeds 0–99)
 
-| Seed | True onset | Rules said | Why |
+| Seed | Truth | Rules said | Why |
 |---|---|---|---|
-| 24, 92 | 6.2, 4.5 | none | the drift stays inside the DBC range, and the trend fit is below its threshold |
-| 19 | 6.0 | drift @ 3.8 | trend found, but the bend was placed too early |
-| 51, 61, 71, 73 | 3.4, 4.9, 3.9, 3.6 | drift, onset off by >0.5 s | range crossing caught, but the healthy sinusoid confuses where the ramp starts |
+| 24, 64, 74, 92 | drift @ 2.7, 3.2, 3.5, 5.0 | none | the drift stays inside the DBC range, and the trend fit is below its threshold |
+| 19 | drift @ 5.6 | drift @ 3.7 | trend found, but the bend was placed too early |
+| 51, 60, 71, 73 | drift @ 4.8, 2.9, 2.2, 2.4 | drift, onset off by >0.5 s | the range crossing was caught, but the healthy sinusoid confuses where the ramp starts |
+| 32 | none | drift @ 0.6 | false alarm: F=26 against a threshold of 25. The threshold was tuned on dev seeds and deliberately left alone after seeing this |

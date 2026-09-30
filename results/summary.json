@@ -7,24 +7,25 @@
     {
       "detector": "rules",
       "cases": 100,
-      "exact_pct": 93.0,
-      "type_pct": 98.0,
-      "signal_pct": 98.0,
+      "exact_pct": 90.0,
+      "type_pct": 95.0,
+      "signal_pct": 95.0,
       "per_type_exact": {
-        "none": "21/21",
+        "none": "20/21",
         "stuck_at": "16/16",
         "dropout": "15/15",
         "out_of_range": "12/12",
         "spike": "16/16",
-        "drift": "13/20"
+        "drift": "11/20"
       },
       "errors": 0,
       "cost_usd_total": 0.0,
       "cost_usd_per_case": 0.0,
-      "latency_s_median": 0.0146,
-      "latency_s_p95": 0.0174,
+      "latency_s_median": 0.0155,
+      "latency_s_p95": 0.0183,
       "confusion": {
-        "drift -> none": 2
+        "drift -> none": 4,
+        "none -> drift": 1
       }
     }
   ]
