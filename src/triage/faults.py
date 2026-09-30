@@ -57,7 +57,11 @@ def inject_fault(
     if fault_type not in FAULT_TYPES:
         raise ValueError(f"unknown fault type {fault_type!r}")
 
-    rng = random.Random(seed)
+    # Own random stream. make_case also seeds Random(seed) and its first
+    # draw (< 0.2 means "clean") would otherwise be reused here as the
+    # onset draw, so faulty cases could only get onsets above ~32% of the
+    # run instead of anywhere in the middle 60%.
+    rng = random.Random(f"inject:{seed}")
     msg_name, sig = target
     t_end = rows[-1]["t"]
     onset = round(rng.uniform(0.2 * t_end, 0.8 * t_end), 1)
