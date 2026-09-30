@@ -6,6 +6,7 @@ Stage 1 tests. Standard-library unittest, so they run with no extra install:
 (pytest also picks them up if you have it.)
 """
 
+import json
 import sys
 import unittest
 from collections import Counter
@@ -115,25 +116,44 @@ class TestLlmWithoutNetwork(unittest.TestCase):
         self.case = harness.build_case(MESSAGES, 3)
         self.sent = None
 
-    def fake_post(self, body):
+    def fake_post(self, body, **override):
         self.sent = body
         lab = self.case.label
+        reply = {"fault_type": lab.fault_type, "signal": lab.signal,
+                 "onset_t": lab.onset_t, "explanation": "test"}
+        reply.update(override)
         return {
-            "content": [{"type": "tool_use", "name": "report_diagnosis",
-                         "input": {"fault_type": lab.fault_type, "signal": lab.signal,
-                                   "onset_t": lab.onset_t, "explanation": "test"}}],
+            "stop_reason": "end_turn",
+            "content": [{"type": "thinking", "thinking": "..."},
+                        {"type": "text", "text": json.dumps(reply)}],
             "usage": {"input_tokens": 2500, "output_tokens": 150},
         }
 
     def test_request_shape_and_parsing(self):
         d, meta = llm.diagnose_llm(self.case.rows, self.case.signals,
                                    model="claude-sonnet-5-5", post=self.fake_post)
-        self.assertEqual(self.sent["tool_choice"], {"type": "tool", "name": "report_diagnosis"})
-        self.assertEqual(self.sent["temperature"], 0)
-        enum = self.sent["tools"][0]["input_schema"]["properties"]["signal"]["enum"]
-        self.assertEqual(set(enum), {""} | set(self.case.signals))
+        # Sonnet 5.5 rejects forced tool_choice and non-default temperature.
+        self.assertNotIn("temperature", self.sent)
+        self.assertNotIn("tool_choice", self.sent)
+        schema = self.sent["output_config"]["format"]["schema"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(set(schema["properties"]["signal"]["enum"]), {""} | set(self.case.signals))
         self.assertTrue(harness.score(d, self.case.label).exact)
         self.assertAlmostEqual(meta["cost_usd"], (2500 * 2 + 150 * 10) / 1e6)
+
+    def test_enum_casing_is_normalised(self):
+        lab = self.case.label
+        post = lambda b: self.fake_post(b, fault_type=lab.fault_type.upper(), signal=lab.signal.lower())
+        d, _ = llm.diagnose_llm(self.case.rows, self.case.signals, post=post)
+        self.assertEqual((d.fault_type, d.signal), (lab.fault_type, lab.signal))
+
+    def test_bad_replies_raise(self):
+        with self.assertRaises(RuntimeError):
+            llm.diagnose_llm(self.case.rows, self.case.signals,
+                             post=lambda b: {"stop_reason": "max_tokens", "content": []})
+        with self.assertRaises(RuntimeError):
+            llm.diagnose_llm(self.case.rows, self.case.signals,
+                             post=lambda b: self.fake_post(b, fault_type="stuck_at", signal="NOT_A_SIGNAL"))
 
     def test_dropout_shows_as_empty_cells(self):
         selected = [(m, s) for m, s in self.case.signals.values()]

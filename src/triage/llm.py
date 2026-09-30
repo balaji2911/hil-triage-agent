@@ -9,13 +9,19 @@ the harness can score both identically:
 
 Design choices worth defending:
 
-  * Forced tool call, not "please reply in JSON". The API is told the model
-    must call `report_diagnosis`, whose schema restricts fault_type to the
-    six labels and signal to the six names actually in the trace. The model
-    cannot invent a seventh fault type or misspell a signal; the output is
-    parsed by the API, not by a regex over prose.
-  * Temperature 0, so reruns give (near-)identical answers and a change in
-    score means a change in the system, not luck.
+  * Structured outputs (`output_config.format` with a JSON schema), not
+    "please reply in JSON". The API constrains decoding so the reply is
+    valid JSON in that shape, with fault_type limited to the six labels and
+    signal limited to the names actually in the trace. The code still
+    validates the result, because the docs note enum casing isn't
+    guaranteed, and a truncated or refused reply can break the schema.
+    (Forced tool calls, the older way to do this, return a 400 on
+    Sonnet 5.5 / Opus 5.5.)
+  * No temperature setting. Current models reject non-default sampling
+    parameters, so run-to-run variation is handled the scientific way:
+    rerun the harness and report the spread.
+  * The model's default adaptive thinking is left on. Thinking tokens are
+    billed as output and count toward max_tokens, hence the 8k budget.
   * Wide table (one row per timestamp, one column per signal). A missing
     sample is an empty cell, which is exactly how a dropout looks to an
     engineer reading a CANoe trace. It is also ~3x fewer tokens than one
@@ -24,7 +30,7 @@ Design choices worth defending:
     thresholds. The rules have thresholds tuned on dev seeds; the LLM gets
     the same definitions a new test engineer would.
   * Plain urllib instead of the anthropic SDK: one POST, no dependency,
-    and the request body is visible in one place.
+    and the whole request body is visible in one place.
 
 Needs ANTHROPIC_API_KEY in the environment (or in a git-ignored .env file
 at the repo root). Model defaults to claude-sonnet-5-5; override with the
@@ -48,6 +54,7 @@ from .rules import Diagnosis
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-sonnet-5-5"
+MAX_TOKENS = 8000
 
 # USD per million tokens (input, output), from platform.claude.com pricing,
 # checked 2026-10-01. Cost is computed from the token counts the API returns.
@@ -57,6 +64,8 @@ PRICES = {
     "claude-haiku-4-5-20251001": (1.0, 5.0),
     "claude-fable-5-1": (10.0, 50.0),
 }
+
+LABELS = ("none", *FAULT_TYPES)
 
 SYSTEM = (
     "You are a hardware-in-the-loop (HiL) validation engineer triaging a CAN "
@@ -75,23 +84,20 @@ Fault types:
 onset_t is the timestamp of the first affected sample. For none, use signal "" and onset_t 0."""
 
 
-def _tool(signal_names: list[str]) -> dict:
+def output_schema(signal_names: list[str]) -> dict:
     return {
-        "name": "report_diagnosis",
-        "description": "Report the single most likely diagnosis for this trace.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "fault_type": {"type": "string", "enum": ["none", *FAULT_TYPES]},
-                "signal": {"type": "string", "enum": ["", *signal_names]},
-                "onset_t": {"type": "number", "description": "seconds"},
-                "explanation": {
-                    "type": "string",
-                    "description": "2-3 sentences: what in the trace shows the fault, and a plausible root cause on a HiL rig.",
-                },
+        "type": "object",
+        "properties": {
+            "fault_type": {"type": "string", "enum": list(LABELS)},
+            "signal": {"type": "string", "enum": ["", *signal_names]},
+            "onset_t": {"type": "number", "description": "seconds"},
+            "explanation": {
+                "type": "string",
+                "description": "2-3 sentences: what in the trace shows the fault, and a plausible root cause on a HiL rig.",
             },
-            "required": ["fault_type", "signal", "onset_t", "explanation"],
         },
+        "required": ["fault_type", "signal", "onset_t", "explanation"],
+        "additionalProperties": False,
     }
 
 
@@ -103,7 +109,7 @@ def format_trace(rows: list[dict], signals: dict[str, tuple[str, Signal]]) -> st
         grid.setdefault(r["t"], {})[r["sig"]] = r["val"]
     lines = ["t," + ",".join(names)]
     for t in sorted(grid):
-        cells = [f"{grid[t][n]:.6g}" if n in grid[t] else "" for n in names]
+        cells = [f"{grid[t][n]:.10g}" if n in grid[t] else "" for n in names]
         lines.append(f"{t:g}," + ",".join(cells))
     return "\n".join(lines)
 
@@ -116,45 +122,66 @@ def build_prompt(rows: list[dict], signals: dict[str, tuple[str, Signal]]) -> st
         "Signals in this trace (from the DBC):\n" + "\n".join(table)
         + "\n\n" + FAULT_DEFINITIONS
         + "\n\nTrace (10 Hz):\n" + format_trace(rows, signals)
-        + "\n\nCall report_diagnosis once with your diagnosis."
+        + "\n\nReport your diagnosis."
     )
 
 
 def _api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     env_file = Path(__file__).resolve().parents[2] / ".env"
     if not key and env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("ANTHROPIC_API_KEY="):
-                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+        try:
+            # utf-8-sig also accepts the byte-order mark Notepad adds.
+            text = env_file.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raise RuntimeError(
+                ".env is not UTF-8 (PowerShell 5 '>' writes UTF-16). Recreate it with: "
+                'Set-Content .env "ANTHROPIC_API_KEY=sk-ant-..." -Encoding utf8'
+            ) from None
+        for line in text.splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            if line.startswith("ANTHROPIC_API_KEY="):
+                key = line.split("=", 1)[1].split("#", 1)[0].strip().strip('"').strip("'")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY not set (environment or .env at repo root)")
     return key
 
 
-def _http_post(body: dict) -> dict:
-    """POST to the Messages API with simple retries on rate limits and overloads."""
+RETRY_STATUS = (429, 500, 502, 503, 529)
+
+
+def _http_post(body: dict, attempts: int = 5) -> dict:
+    """POST to the Messages API, retrying rate limits, overloads and network blips.
+
+    A 400/401/403 is a bug in the request or the key: retrying can't fix
+    it, so it is raised at once.
+    """
     headers = {
         "x-api-key": _api_key(),
         "anthropic-version": API_VERSION,
         "content-type": "application/json",
     }
-    for attempt in range(5):
-        req = urllib.request.Request(API_URL, json.dumps(body).encode(), headers, method="POST")
+    data = json.dumps(body).encode()
+    for attempt in range(attempts):
+        last = attempt == attempts - 1
+        req = urllib.request.Request(API_URL, data, headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")
-            if e.code in (429, 500, 502, 503, 529) and attempt < 4:
-                time.sleep(2 ** attempt * 2)
-                continue
-            # Some newer models reject sampling parameters; retry once without.
-            if e.code == 400 and "temperature" in detail and "temperature" in body:
-                body = {k: v for k, v in body.items() if k != "temperature"}
-                continue
-            raise RuntimeError(f"API error {e.code}: {detail[:300]}") from None
-    raise RuntimeError("API still failing after retries")
+            if e.code not in RETRY_STATUS or last:
+                raise RuntimeError(f"API error {e.code}: {detail[:300]}") from None
+            wait = float(e.headers.get("retry-after") or 2 ** (attempt + 1))
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if last:
+                raise RuntimeError(f"network error: {e}") from None
+            wait = 2 ** (attempt + 1)
+        time.sleep(min(wait, 60))
+    raise AssertionError("unreachable")
+
+
+_unpriced_warned: set[str] = set()
 
 
 def diagnose_llm(
@@ -166,40 +193,55 @@ def diagnose_llm(
     """Return (Diagnosis, meta) where meta has latency, tokens and cost.
 
     `post` is injectable so tests can run without a network or a key.
+    Raises on a reply that is truncated, refused, or doesn't fit the schema;
+    the harness records that case as an error.
     """
     model = model or os.environ.get("TRIAGE_MODEL", DEFAULT_MODEL)
+    names = list(signals)
     body = {
         "model": model,
-        "max_tokens": 1024,
-        "temperature": 0,
+        "max_tokens": MAX_TOKENS,
         "system": SYSTEM,
-        "tools": [_tool(list(signals))],
-        "tool_choice": {"type": "tool", "name": "report_diagnosis"},
         "messages": [{"role": "user", "content": build_prompt(rows, signals)}],
+        "output_config": {"format": {"type": "json_schema", "schema": output_schema(names)}},
     }
 
     t0 = time.perf_counter()
     resp = post(body)
     latency = time.perf_counter() - t0
 
-    call = next((b for b in resp.get("content", []) if b.get("type") == "tool_use"), None)
-    if call is None:
-        raise RuntimeError(f"no tool call in response: {str(resp)[:300]}")
-    out = call["input"]
+    stop = resp.get("stop_reason")
+    if stop in ("max_tokens", "refusal"):
+        raise RuntimeError(f"reply ended with stop_reason={stop}")
+    text = next((b["text"] for b in resp.get("content", []) if b.get("type") == "text"), None)
+    if text is None:
+        raise RuntimeError(f"no text block in response: {str(resp)[:300]}")
+    out = json.loads(text)
+
+    fault_type = str(out.get("fault_type", "")).strip().lower()
+    if fault_type not in LABELS:
+        raise RuntimeError(f"unknown fault_type {out.get('fault_type')!r}")
+    by_lower = {n.lower(): n for n in names}
+    signal = by_lower.get(str(out.get("signal", "")).strip().lower(), None)
+    if fault_type != "none" and signal is None:
+        raise RuntimeError(f"unknown signal {out.get('signal')!r}")
 
     usage = resp.get("usage", {})
     tin, tout = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+    if model not in PRICES and model not in _unpriced_warned:
+        _unpriced_warned.add(model)
+        print(f"warning: no price for {model}; cost reported as 0")
     p_in, p_out = PRICES.get(model, (0.0, 0.0))
     meta = {
         "latency_s": latency,
         "input_tokens": tin,
-        "output_tokens": tout,
+        "output_tokens": tout,      # includes thinking tokens
         "cost_usd": (tin * p_in + tout * p_out) / 1e6,
         "model": model,
     }
     diag = Diagnosis(
-        fault_type=out["fault_type"],
-        signal=out.get("signal", "") if out["fault_type"] != "none" else "",
+        fault_type=fault_type,
+        signal=signal if fault_type != "none" else "",
         onset_t=float(out.get("onset_t", 0.0)),
         evidence=out.get("explanation", ""),
     )
