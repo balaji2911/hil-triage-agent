@@ -15,10 +15,13 @@ check that looks for the fingerprint that fault leaves in a trace:
     stuck_at      flat     many consecutive samples with exactly equal values
 
 The detector sees only what the LLM sees: the trace rows plus the DBC
-definition (message, range, unit) of each signal in it. It knows nothing
-about how the generator builds waveforms. The thresholds below were tuned
-on development seeds 1000-1199; the harness scores on seeds 0-99, which
-were never used for tuning.
+definition (message, range, unit) of each signal in it. It does carry
+assumptions that happen to match the synthetic data: healthy signals are
+smooth and noisy (so never exactly repeat), and a drift is a linear ramp.
+Those are reasonable priors for real sensor data too, but they make this
+baseline an upper bound, not a neutral one. The thresholds below were
+tuned on development seeds 1000-1199; the harness scores on seeds 0-99,
+which were never used for tuning.
 
 Precedence: a trace has at most one fault, but a check can misfire on a
 healthy signal. When several signals are flagged we keep the finding from
@@ -50,10 +53,11 @@ GAP_MIN_SAMPLES = 3
 # Trend check: a signal is modelled as a smooth curve (degree-5 polynomial),
 # optionally plus a bend at time tau that starts a linear ramp. If adding the
 # bend improves the fit by more than this F-statistic, we call it drift.
-# Swept 20-40 on dev seeds: 25-35 give identical results (no false drift
-# calls, 24/39 drifts caught); 30 sits in the middle of that plateau.
+# Swept 15-50 on dev seeds: 20-30 give identical results (no false drift
+# calls, 17/39 drifts fully right); 15 starts calling healthy signals
+# drift, 35+ starts missing drifts. 25 sits in the middle of the plateau.
 TREND_POLY_DEGREE = 5
-TREND_F_THRESHOLD = 30.0
+TREND_F_THRESHOLD = 25.0
 
 # Lower number = more specific evidence = wins when several signals flag.
 PRECEDENCE = {"dropout": 0, "spike": 1, "out_of_range": 2, "stuck_at": 3, "drift": 4}
@@ -72,7 +76,9 @@ NO_FAULT = Diagnosis("none", evidence="no check fired")
 
 
 def _series(rows: list[dict], name: str) -> tuple[np.ndarray, np.ndarray]:
-    pts = [(r["t"], r["val"]) for r in rows if r["sig"] == name]
+    # Non-numeric or NaN readings are dropped, so they show up as gaps.
+    pts = [(r["t"], r["val"]) for r in rows
+           if r["sig"] == name and isinstance(r["val"], (int, float)) and np.isfinite(r["val"])]
     if not pts:
         return np.array([]), np.array([])
     t, v = zip(*pts)
@@ -171,7 +177,7 @@ def trend_fit(t: np.ndarray, v: np.ndarray) -> tuple[float, float] | None:
         x = np.column_stack([base, np.maximum(0.0, t - tau)])
         c, *_ = np.linalg.lstsq(x, v, rcond=None)
         rss1 = float(((v - x @ c) ** 2).sum())
-        if rss1 <= 0:
+        if not np.isfinite(rss1) or rss1 <= 0:
             continue
         f = (rss0 - rss1) / (rss1 / (n - x.shape[1]))
         if best is None or f > best[0]:
