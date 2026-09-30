@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import statistics
 import time
@@ -48,6 +49,7 @@ RESULTS_DIR = REPO / "results"
 
 SIGNALS_PER_CASE = 6
 ONSET_TOLERANCE_S = 0.5   # five samples at 10 Hz
+FAIL_FAST_AFTER = 3       # stop if this many cases in a row fail from the start
 
 
 @dataclass
@@ -63,8 +65,17 @@ def build_case(messages: dict[str, Message], seed: int) -> Case:
 
     Signal choice uses its own random stream (seeded with a string) so it
     doesn't share draws with make_case, which seeds Random(seed) itself.
+
+    Five signal names (TQI, N, TQFR, TQI_ACOR, PV_AV_CAN) appear in two
+    messages each. Rows, the LLM table and the injector all identify a
+    signal by name, so only the first message carrying each name is kept:
+    150 measurement signals -> 145 unique names.
     """
-    pool = measurement_signals(messages)
+    pool, seen = [], set()
+    for m, s in measurement_signals(messages):
+        if s.name not in seen:
+            seen.add(s.name)
+            pool.append((m, s))
     selected = random.Random(f"signals:{seed}").sample(pool, SIGNALS_PER_CASE)
     healthy = generate_trace(selected, TraceConfig(seed=seed))
     rows, label = make_case(healthy, selected, seed)
@@ -103,13 +114,22 @@ def run_llm(case: Case) -> tuple[Diagnosis, dict]:
 
 
 def evaluate(name: str, runner, cases: list[Case], out_dir: Path) -> dict:
-    """Run one detector over all cases, write per-case records, return a summary."""
+    """Run one detector over all cases, write per-case records, return a summary.
+
+    One failed call is recorded as an "error" prediction (scored wrong) and
+    the run continues. But if the first cases all fail, the problem is the
+    setup (no key, bad request), not the model, so stop instead of
+    reporting a meaningless 0%.
+    """
     records = []
-    for case in cases:
+    for i, case in enumerate(cases):
         try:
             pred, meta = runner(case)
-        except Exception as e:           # one failed call must not kill a 100-case run
-            pred, meta = Diagnosis("error", evidence=f"{type(e).__name__}: {e}"), {"latency_s": 0.0, "cost_usd": 0.0}
+        except Exception as e:
+            pred, meta = Diagnosis("error", evidence=f"{type(e).__name__}: {e}"), {"latency_s": None, "cost_usd": 0.0}
+            print(f"  [{name}] seed {case.seed}: {pred.evidence}", flush=True)
+            if i == FAIL_FAST_AFTER - 1 and all(r["pred"]["fault_type"] == "error" for r in records):
+                raise SystemExit(f"{name}: first {FAIL_FAST_AFTER} cases all failed; last error: {pred.evidence}")
         s = score(pred, case.label)
         records.append({
             "seed": case.seed,
@@ -137,7 +157,7 @@ def summarise(name: str, records: list[dict]) -> dict:
         if sub:
             per_type[ft] = f'{sum(r["score"]["exact"] for r in sub)}/{len(sub)}'
     confusion = Counter((r["label"]["fault_type"], r["pred"]["fault_type"]) for r in records)
-    lat = [r["latency_s"] for r in records]
+    lat = sorted(r["latency_s"] for r in records if r["latency_s"] is not None) or [0.0]
     return {
         "detector": name,
         "cases": n,
@@ -149,7 +169,7 @@ def summarise(name: str, records: list[dict]) -> dict:
         "cost_usd_total": round(sum(r["cost_usd"] for r in records), 4),
         "cost_usd_per_case": round(sum(r["cost_usd"] for r in records) / n, 5),
         "latency_s_median": round(statistics.median(lat), 4),
-        "latency_s_p95": round(sorted(lat)[max(0, int(0.95 * n) - 1)], 4),
+        "latency_s_p95": round(lat[math.ceil(0.95 * len(lat)) - 1], 4),
         "confusion": {f"{a} -> {b}": c for (a, b), c in sorted(confusion.items()) if a != b},
     }
 
@@ -172,6 +192,8 @@ def main() -> None:
     ap.add_argument("--llm", action="store_true", help="also run the LLM detector")
     ap.add_argument("--out", type=Path, default=RESULTS_DIR)
     args = ap.parse_args()
+    if args.n < 1:
+        ap.error("--n must be at least 1")
 
     messages = parse_dbc(DBC_PATH)
     cases = [build_case(messages, s) for s in range(args.start, args.start + args.n)]
